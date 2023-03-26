@@ -10,6 +10,9 @@ import re
 import torch
 import json
 import datetime
+import asyncio
+import threading
+import time
 from transformers import AutoTokenizer, AutoModel
 from telegram import Update
 from telegram.constants import ParseMode
@@ -24,6 +27,8 @@ os.chdir(script_path)
 token = 'aaaaaaaaaa:88888888888888888888888888888888888'
 admin_id = ['000000000']
 fine_granted_identifier = []
+stream_chat = True
+stream_chat_debounce = 1.5
 
 # load from fine_granted_identifier.json if exists
 try:
@@ -61,6 +66,20 @@ class Chat:
             response, self.history = model.chat(tokenizer, query, history=self.history, max_length=16384) # let the cuda crash so we clear the history
             if len(response) <= 0: raise Exception("empty response")
             return response
+        except Exception as e:
+            print(f"[!] error chatting: {e}")
+            self.history = []
+            return "An error occurred, please try again later. Your conversation history has been reset."
+        finally:
+            torch.cuda.empty_cache()
+    
+    def stream_chat(self, query) -> str:
+        self.last_message_time = datetime.datetime.now()
+        try:
+            for response, self.history in model.stream_chat(tokenizer, query, history=self.history, max_length=16384): # let the cuda crash so we clear the history
+                yield response
+            if len(response) <= 0: raise Exception("empty response")
+            yield response
         except Exception as e:
             print(f"[!] error chatting: {e}")
             self.history = []
@@ -185,7 +204,6 @@ async def reset_chat(update: Update, context):
     else:
         await update.message.reply_text('Chat history is empty')
 
-
 async def recv_msg(update: Update, context):
     if not check_should_handle(update, context): return
     if not validate_user(update):
@@ -200,7 +218,7 @@ async def recv_msg(update: Update, context):
     print(f"[i] {update.effective_user.username} said: {update.message.text}")
 
     message = await update.message.reply_text(
-        '... thinking ...'
+        '🤔'
     )
     if message is None:
         print("[!] failed to send message")
@@ -211,10 +229,50 @@ async def recv_msg(update: Update, context):
         # remove bot name from text with @
         pattern = f"@{context.bot.username}"
         input_text = input_text.replace(pattern, '')
-        response = chat_session.chat(input_text)
-        response = chat_session.finalize_resp_text(response)
-        print(f"[i] {update.effective_user.username} reply: {response}")
-        await message.edit_text(response)
+        if not stream_chat:
+            response = chat_session.chat(input_text)
+            response = chat_session.finalize_resp_text(response)
+            print(f"[i] {update.effective_user.username} reply: {response}")
+            await message.edit_text(response)
+        else:
+            
+            has_finished = False
+            last_response = ""
+
+            def stream_chat_task():
+                nonlocal last_response, has_finished
+                for response in chat_session.stream_chat(input_text):
+                    last_response = response
+                has_finished = True
+
+            # Start stream_chat_task as a separate thread
+            chat_task = threading.Thread(target=stream_chat_task)
+            chat_task.start()
+            
+            # Run edit message task on the main thread
+            last_finalized_response = ""
+            while not has_finished:
+                if last_response == "":
+                    time.sleep(0.1)
+                    continue
+                finalized_response = chat_session.finalize_resp_text(last_response)
+                if last_finalized_response == finalized_response:
+                    continue
+                if len(finalized_response) > len(last_finalized_response):
+                    print(finalized_response[len(last_finalized_response):], end='')
+                last_finalized_response = finalized_response
+                time.sleep(stream_chat_debounce)
+                await message.edit_text(last_response + '\n\n🤔')
+
+            # Wait for the chat_task to finish
+            chat_task.join()
+            
+            # Finalize the response
+            final_response = chat_session.finalize_resp_text(last_response)
+            if final_response != last_finalized_response:
+                if len(final_response) > len(last_finalized_response):
+                    print(final_response[len(last_finalized_response):])
+                await message.edit_text(final_response, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         print(f"[!] error: {e}")
         chat_session.reset()
